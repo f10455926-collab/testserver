@@ -1,0 +1,6 @@
+requests>=2.31.0
+cloudscraper>=1.2.71
+PySocks>=1.7.1
+colorama>=0.4.6
+undetected-chromedriver>=3.5.4
+httpx[http2]>=0.26.0
